@@ -1,0 +1,11 @@
+CUSTOMER_ID,CUSTOMER_NAME,SEGMENT,INDUSTRY,REGION,COUNTRY,CITY,EMAIL,PHONE,PAN_NUMBER,CREATED_DATE,CREDIT_LIMIT
+1,"Aarav Industries Pvt Ltd",Enterprise,Manufacturing,West,India,Mumbai,accounts@aarav-industries.example.com,+91-22-40001001,AAAPA1001A,2024-01-05,950000.00
+2,"Blue Ridge Retail LLC",Mid-Market,Retail,East,USA,New York,ap@blueridge-retail.example.com,+1-212-5550102,BBBPB1002B,2024-01-07,420000.00
+3,"Corvus Logistics Ltd",Mid-Market,Logistics,South,UK,London,finance@corvus-logistics.example.com,+44-20-79460103,CCCPC1003C,2024-01-09,310000.00
+4,"Drachen Maschinenbau GmbH",Enterprise,Manufacturing,Central,Germany,Munich,einkauf@drachen-mb.example.com,+49-89-20000104,DDDPD1004D,2024-01-11,1200000.00
+5,"Eiko Electronics KK",SMB,Electronics,North,Japan,Osaka,order@eiko-elec.example.com,+81-6-60000105,EEEPE1005E,2024-01-13,85000.00
+5001,"Fernhill Foods Pte Ltd",SMB,Food & Beverage,South,Singapore,Singapore,hello@fernhill-foods.example.com,+65-6100-5001,FFFPF5001F,2026-09-20,60000.00
+5002,"Gulmohar Textiles",Mid-Market,Textiles,West,India,Ahmedabad,purchase@gulmohar-tex.example.com,+91-79-40005002,GGGPG5002G,2026-09-21,275000.00
+5003,"Harbor Point Health Inc",Enterprise,Healthcare,West,USA,San Diego,procurement@harborpoint.example.com,+1-619-5555003,HHHPH5003H,2026-09-22,800000.00
+5004,"Isarwerk Energie AG",Enterprise,Energy,South,Germany,Stuttgart,lieferanten@isarwerk.example.com,+49-711-2005004,IIIPI5004I,2026-09-23,990000.00
+5005,"Jade Lantern Consumer",Consumer,Retail,East,UK,Manchester,jade.lantern@example.com,+44-161-4965005,JJJPJ5005J,2026-09-24,15000.00
