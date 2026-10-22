@@ -1,0 +1,216 @@
+/*=============================================================================
+  MIGRATION ASSESSMENT 04 - Complexity scoring, effort and migration waves
+  Creates: V_COLUMN_TYPE_MAP, V_SYNTAX_HITS, V_DEPENDENCY_DEPTH views,
+           SP_RUN_ASSESSMENT() -> ASSESSMENT_RESULT table, summary views.
+  Score  = object-type base + data-type conversion points (max 10)
+         + proprietary-syntax points (each rule counted up to 3 hits)
+         + code-size points + volume points + 0.5 per upstream dependency (max 5)
+  Bands  : COMPLEXITY_BANDS (Low <4, Medium <10, High <20, Very High >=20)
+  Effort : EFFORT_MODEL.BASE_HOURS x band multiplier (+ data movement hours for tables)
+  Waves  : longest dependency chain (wave 1 = no upstream dependencies);
+           wave 0 = unused objects recommended for retirement.
+  Run as : ACCEL_ADMIN. Rerun: safe.
+=============================================================================*/
+
+USE ROLE ACCEL_ADMIN;
+USE WAREHOUSE ACCEL_WH;
+USE DATABASE ACCEL_DB;
+CREATE SCHEMA IF NOT EXISTS MIGRATION_ASSESSMENT;
+USE SCHEMA MIGRATION_ASSESSMENT;
+
+------------------------------------------------------------------------------
+-- 1. Rule-hit views (also used for drill-down in the Streamlit app)
+------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW V_COLUMN_TYPE_MAP AS
+SELECT c.FULL_NAME, c.COLUMN_NAME, c.ORDINAL_POSITION, c.DATA_TYPE,
+       t.SNOWFLAKE_TYPE, COALESCE(t.POINTS, 0) AS POINTS, t.NOTE
+FROM SRC_COLUMNS c
+JOIN SRC_OBJECTS o ON o.FULL_NAME = c.FULL_NAME
+LEFT JOIN TYPE_RULES t
+  ON (t.SOURCE_PLATFORM = o.SOURCE_PLATFORM OR t.SOURCE_PLATFORM = 'ANY')
+ AND UPPER(TRIM(c.DATA_TYPE)) LIKE t.TYPE_PATTERN
+QUALIFY ROW_NUMBER() OVER (PARTITION BY c.FULL_NAME, c.COLUMN_NAME ORDER BY t.POINTS DESC NULLS LAST) = 1;
+
+CREATE OR REPLACE VIEW V_SYNTAX_HITS AS
+SELECT x.FULL_NAME, x.RULE_ID, x.KEYWORD, x.CATEGORY, x.POINTS, x.HITS,
+       x.POINTS * LEAST(x.HITS, 3) AS WEIGHTED_POINTS, x.SNOWFLAKE_APPROACH
+FROM (
+  SELECT c.FULL_NAME, r.RULE_ID, r.KEYWORD, r.CATEGORY, r.POINTS, r.SNOWFLAKE_APPROACH,
+         REGEXP_COUNT(UPPER(c.CODE_TEXT), r.PATTERN, 1, 'm') AS HITS
+  FROM SRC_CODE c
+  JOIN SRC_OBJECTS o ON o.FULL_NAME = c.FULL_NAME
+  JOIN SYNTAX_RULES r ON r.SOURCE_PLATFORM IN (o.SOURCE_PLATFORM, 'ANY')
+) x
+WHERE x.HITS > 0;
+
+-- Longest upstream chain per object (cycle-safe: depth capped at 10)
+CREATE OR REPLACE VIEW V_DEPENDENCY_DEPTH AS
+WITH RECURSIVE walk (FULL_NAME, DEPTH) AS (
+  SELECT FULL_NAME, 1 FROM SRC_OBJECTS
+  UNION ALL
+  SELECT d.OBJECT_FULL_NAME, w.DEPTH + 1
+  FROM walk w
+  JOIN SRC_DEPENDENCIES d ON d.DEPENDS_ON_FULL_NAME = w.FULL_NAME
+  WHERE w.DEPTH < 10
+)
+SELECT FULL_NAME, MAX(DEPTH) AS DEPTH FROM walk GROUP BY FULL_NAME;
+
+------------------------------------------------------------------------------
+-- 2. Results table + run log
+------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ASSESSMENT_RUNS (
+  RUN_ID              VARCHAR,
+  RUN_TS              TIMESTAMP_NTZ,
+  OBJECTS_SCORED      NUMBER,
+  TOTAL_EFFORT_HOURS  NUMBER(12,1)
+);
+
+CREATE OR REPLACE PROCEDURE SP_RUN_ASSESSMENT()
+RETURNS VARCHAR
+LANGUAGE SQL
+COMMENT = 'Scores every SRC_OBJECTS row and rebuilds ASSESSMENT_RESULT'
+AS
+$$
+DECLARE
+  run_id       VARCHAR DEFAULT UUID_STRING();
+  n_obj        INTEGER DEFAULT 0;
+  total_hours  NUMBER(12,1) DEFAULT 0;
+BEGIN
+  CREATE OR REPLACE TABLE ASSESSMENT_RESULT AS
+  WITH type_score AS (
+    SELECT FULL_NAME, SUM(POINTS) AS TYPE_POINTS, COUNT_IF(POINTS > 0) AS COLS_NEEDING_CONVERSION
+    FROM V_COLUMN_TYPE_MAP GROUP BY FULL_NAME
+  ),
+  syntax_score AS (
+    SELECT FULL_NAME, SUM(WEIGHTED_POINTS) AS SYNTAX_POINTS, COUNT(*) AS RULES_HIT,
+           LISTAGG(KEYWORD, ', ') WITHIN GROUP (ORDER BY WEIGHTED_POINTS DESC) AS FLAGGED_PATTERNS
+    FROM V_SYNTAX_HITS GROUP BY FULL_NAME
+  ),
+  deps_up AS (
+    SELECT OBJECT_FULL_NAME AS FULL_NAME, COUNT(*) AS UPSTREAM_DEPS
+    FROM SRC_DEPENDENCIES GROUP BY OBJECT_FULL_NAME
+  ),
+  deps_down AS (
+    SELECT DEPENDS_ON_FULL_NAME AS FULL_NAME, COUNT(*) AS DOWNSTREAM_REFS
+    FROM SRC_DEPENDENCIES GROUP BY DEPENDS_ON_FULL_NAME
+  ),
+  usage_stats AS (
+    SELECT FULL_NAME, SUM(EXEC_COUNT) AS EXEC_COUNT_LOGGED,
+           ROUND(SUM(TOTAL_CPU_SEC) / 3600, 1) AS CPU_HOURS_LOGGED,
+           COUNT(DISTINCT USER_NAME) AS DISTINCT_USERS
+    FROM SRC_QUERY_LOG GROUP BY FULL_NAME
+  ),
+  log_window AS (
+    SELECT MAX(LOG_MONTH) AS LAST_LOG_MONTH FROM SRC_QUERY_LOG
+  ),
+  base AS (
+    SELECT o.*,
+           COALESCE(ts.COLS_NEEDING_CONVERSION, 0)       AS COLS_NEEDING_CONVERSION,
+           COALESCE(ss.RULES_HIT, 0)                     AS RULES_HIT,
+           ss.FLAGGED_PATTERNS,
+           COALESCE(du.UPSTREAM_DEPS, 0)                 AS UPSTREAM_DEPS,
+           COALESCE(dd.DOWNSTREAM_REFS, 0)               AS DOWNSTREAM_REFS,
+           COALESCE(u.EXEC_COUNT_LOGGED, 0)              AS EXEC_COUNT_LOGGED,
+           COALESCE(u.CPU_HOURS_LOGGED, 0)               AS CPU_HOURS_LOGGED,
+           COALESCE(u.DISTINCT_USERS, 0)                 AS DISTINCT_USERS,
+           COALESCE(dp.DEPTH, 1)                         AS DEPENDENCY_DEPTH,
+           DECODE(o.OBJECT_TYPE, 'TABLE', 0, 'SEQUENCE', 0, 'VIEW', 1, 'FUNCTION', 2, 'MACRO', 3,
+                  'PROCEDURE', 3, 'BTEQ_SCRIPT', 4, 'PACKAGE', 5, 'TRIGGER', 6, 2) AS TYPE_BASE_POINTS,
+           LEAST(COALESCE(ts.TYPE_POINTS, 0), 10)         AS DATATYPE_POINTS,
+           COALESCE(ss.SYNTAX_POINTS, 0)                  AS SYNTAX_POINTS,
+           CASE WHEN COALESCE(o.LINES_OF_CODE, 0) >= 1000 THEN 6
+                WHEN COALESCE(o.LINES_OF_CODE, 0) >= 300  THEN 4
+                WHEN COALESCE(o.LINES_OF_CODE, 0) >= 100  THEN 2
+                WHEN COALESCE(o.LINES_OF_CODE, 0) > 0     THEN 1 ELSE 0 END AS CODE_SIZE_POINTS,
+           CASE WHEN COALESCE(o.SIZE_GB, 0) >= 1000 THEN 4
+                WHEN COALESCE(o.SIZE_GB, 0) >= 100  THEN 2
+                WHEN COALESCE(o.SIZE_GB, 0) >= 10   THEN 1 ELSE 0 END AS VOLUME_POINTS,
+           LEAST(COALESCE(du.UPSTREAM_DEPS, 0) * 0.5, 5)  AS DEPENDENCY_POINTS,
+           (COALESCE(u.EXEC_COUNT_LOGGED, 0) = 0
+              AND o.OBJECT_TYPE NOT IN ('SEQUENCE', 'TRIGGER', 'FUNCTION')
+              AND o.LAST_ACCESSED < DATEADD(MONTH, -6, lw.LAST_LOG_MONTH)) AS IS_UNUSED
+    FROM SRC_OBJECTS o
+    CROSS JOIN log_window lw
+    LEFT JOIN type_score   ts ON ts.FULL_NAME = o.FULL_NAME
+    LEFT JOIN syntax_score ss ON ss.FULL_NAME = o.FULL_NAME
+    LEFT JOIN deps_up      du ON du.FULL_NAME = o.FULL_NAME
+    LEFT JOIN deps_down    dd ON dd.FULL_NAME = o.FULL_NAME
+    LEFT JOIN usage_stats  u  ON u.FULL_NAME  = o.FULL_NAME
+    LEFT JOIN V_DEPENDENCY_DEPTH dp ON dp.FULL_NAME = o.FULL_NAME
+  ),
+  scored AS (
+    SELECT base.*,
+           TYPE_BASE_POINTS + DATATYPE_POINTS + SYNTAX_POINTS + CODE_SIZE_POINTS
+             + VOLUME_POINTS + DEPENDENCY_POINTS AS COMPLEXITY_SCORE
+    FROM base
+  )
+  SELECT
+    s.OBJECT_ID, s.SOURCE_PLATFORM, s.DATABASE_NAME, s.SCHEMA_NAME, s.OBJECT_NAME, s.FULL_NAME,
+    s.OBJECT_TYPE, s.BUSINESS_DOMAIN, s.ROW_COUNT, s.SIZE_GB, s.LINES_OF_CODE, s.OWNER,
+    s.LAST_ALTERED, s.LAST_ACCESSED,
+    s.COLS_NEEDING_CONVERSION, s.RULES_HIT, s.FLAGGED_PATTERNS,
+    s.UPSTREAM_DEPS, s.DOWNSTREAM_REFS, s.EXEC_COUNT_LOGGED, s.CPU_HOURS_LOGGED, s.DISTINCT_USERS,
+    s.TYPE_BASE_POINTS, s.DATATYPE_POINTS, s.SYNTAX_POINTS, s.CODE_SIZE_POINTS,
+    s.VOLUME_POINTS, s.DEPENDENCY_POINTS,
+    s.COMPLEXITY_SCORE::NUMBER(8,2) AS COMPLEXITY_SCORE,
+    b.BAND        AS COMPLEXITY,
+    b.SORT_ORDER  AS COMPLEXITY_ORDER,
+    ROUND(IFF(s.IS_UNUSED, 0.5,
+              COALESCE(e.BASE_HOURS, 4) * b.MULTIPLIER
+              + IFF(s.OBJECT_TYPE = 'TABLE', 1 + CEIL(COALESCE(s.SIZE_GB, 0) / 500) * 2, 0)), 1)::NUMBER(10,1) AS EFFORT_HOURS,
+    s.DEPENDENCY_DEPTH,
+    IFF(s.IS_UNUSED, 0, LEAST(s.DEPENDENCY_DEPTH, 4)) AS MIGRATION_WAVE,
+    CASE WHEN s.IS_UNUSED THEN 'Wave 0 - Retire / archive'
+         WHEN s.DEPENDENCY_DEPTH = 1 THEN 'Wave 1 - Foundation objects'
+         WHEN s.DEPENDENCY_DEPTH = 2 THEN 'Wave 2 - Core transformations'
+         WHEN s.DEPENDENCY_DEPTH = 3 THEN 'Wave 3 - Marts and reporting logic'
+         ELSE 'Wave 4 - Orchestration and complex logic' END AS WAVE_NAME,
+    CASE WHEN s.IS_UNUSED THEN 'Retire: no usage in log window'
+         WHEN s.OBJECT_TYPE = 'TRIGGER' THEN 'Redesign with streams + tasks'
+         WHEN s.OBJECT_TYPE IN ('BTEQ_SCRIPT', 'MACRO') THEN 'Convert to stored procedure + task'
+         WHEN s.OBJECT_TYPE = 'PACKAGE' THEN 'Refactor package into procedures'
+         WHEN b.BAND IN ('High', 'Very High') THEN 'SnowConvert + manual review'
+         ELSE 'Automated conversion (SnowConvert)' END AS RECOMMENDATION,
+    CURRENT_TIMESTAMP()::TIMESTAMP_NTZ AS ASSESSED_AT
+  FROM scored s
+  JOIN COMPLEXITY_BANDS b ON s.COMPLEXITY_SCORE >= b.MIN_SCORE AND s.COMPLEXITY_SCORE < b.MAX_SCORE
+  LEFT JOIN EFFORT_MODEL e ON e.OBJECT_TYPE = s.OBJECT_TYPE
+  ORDER BY MIGRATION_WAVE, COMPLEXITY_SCORE DESC;
+
+  SELECT COUNT(*), COALESCE(SUM(EFFORT_HOURS), 0) INTO :n_obj, :total_hours FROM ASSESSMENT_RESULT;
+
+  INSERT INTO ASSESSMENT_RUNS (RUN_ID, RUN_TS, OBJECTS_SCORED, TOTAL_EFFORT_HOURS)
+  VALUES (:run_id, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, :n_obj, :total_hours);
+
+  RETURN 'Scored ' || n_obj || ' objects, ' || total_hours || ' effort hours (run ' || run_id || ')';
+END;
+$$;
+
+CALL SP_RUN_ASSESSMENT();
+
+------------------------------------------------------------------------------
+-- 3. Summary views
+------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW V_COMPLEXITY_MIX AS
+SELECT SOURCE_PLATFORM, OBJECT_TYPE, COMPLEXITY, COMPLEXITY_ORDER,
+       COUNT(*) AS OBJECTS, SUM(EFFORT_HOURS) AS EFFORT_HOURS
+FROM ASSESSMENT_RESULT
+GROUP BY SOURCE_PLATFORM, OBJECT_TYPE, COMPLEXITY, COMPLEXITY_ORDER;
+
+CREATE OR REPLACE VIEW V_WAVE_PLAN AS
+SELECT MIGRATION_WAVE, WAVE_NAME,
+       COUNT(*)                                   AS OBJECTS,
+       COUNT_IF(OBJECT_TYPE = 'TABLE')            AS TABLES,
+       COUNT_IF(OBJECT_TYPE <> 'TABLE')           AS CODE_OBJECTS,
+       COUNT_IF(COMPLEXITY IN ('High', 'Very High')) AS HIGH_OR_VERY_HIGH,
+       ROUND(SUM(COALESCE(SIZE_GB, 0)), 1)        AS DATA_GB,
+       SUM(EFFORT_HOURS)                          AS EFFORT_HOURS,
+       ROUND(SUM(EFFORT_HOURS) / 8, 1)            AS EFFORT_PERSON_DAYS,
+       LISTAGG(OBJECT_NAME, ', ') WITHIN GROUP (ORDER BY COMPLEXITY_SCORE DESC) AS OBJECT_LIST
+FROM ASSESSMENT_RESULT
+GROUP BY MIGRATION_WAVE, WAVE_NAME;
+
+-- Quick look
+SELECT * FROM V_WAVE_PLAN ORDER BY MIGRATION_WAVE;
+SELECT FULL_NAME, OBJECT_TYPE, COMPLEXITY_SCORE, COMPLEXITY, EFFORT_HOURS, WAVE_NAME, FLAGGED_PATTERNS
+FROM ASSESSMENT_RESULT ORDER BY COMPLEXITY_SCORE DESC LIMIT 15;
