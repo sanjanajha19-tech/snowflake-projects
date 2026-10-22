@@ -1,0 +1,25 @@
+version: 2
+
+sources:
+  - name: demo
+    database: ACCEL_DB
+    schema: DEMO
+    description: Synthetic demo data created by 00_setup
+    tables:
+      - name: customers
+        identifier: CUSTOMERS
+        columns:
+          - name: CUSTOMER_ID
+            tests: [not_null, unique]
+      - name: products
+        identifier: PRODUCTS
+        columns:
+          - name: PRODUCT_ID
+            tests: [not_null, unique]
+      - name: orders
+        identifier: ORDERS
+        columns:
+          - name: ORDER_ID
+            tests: [not_null, unique]
+      - name: order_lines
+        identifier: ORDER_LINES

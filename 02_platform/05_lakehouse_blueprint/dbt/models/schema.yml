@@ -1,0 +1,44 @@
+version: 2
+
+models:
+  - name: stg_customers
+    description: Conformed customers (one row per customer)
+    columns:
+      - name: customer_sk
+        tests: [not_null, unique]
+      - name: customer_id
+        tests: [not_null, unique]
+      - name: region
+        tests:
+          - accepted_values:
+              values: ['North', 'South', 'East', 'West', 'Central']
+
+  - name: stg_sales_lines
+    description: Order lines with header and product cost
+    columns:
+      - name: order_line_sk
+        tests: [not_null, unique]
+      - name: order_status
+        tests:
+          - accepted_values:
+              values: ['DELIVERED', 'SHIPPED', 'CANCELLED', 'RETURNED']
+
+  - name: dim_customer
+    description: Customer dimension
+    columns:
+      - name: customer_sk
+        tests: [not_null, unique]
+
+  - name: fact_sales
+    description: Sales fact at order-line grain
+    columns:
+      - name: order_line_sk
+        tests: [not_null, unique]
+      - name: customer_sk
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_customer')
+              field: customer_sk
+      - name: date_key
+        tests: [not_null]
