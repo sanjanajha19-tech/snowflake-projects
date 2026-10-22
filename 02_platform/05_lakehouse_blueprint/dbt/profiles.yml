@@ -1,0 +1,15 @@
+# profiles.yml for dbt Projects on Snowflake.
+# account / user can stay empty: the project runs inside Snowflake as the current user.
+# For dbt Core on a laptop, fill account/user and add authenticator (e.g. externalbrowser) or a key.
+accel_lakehouse:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: ""
+      user: ""
+      role: ACCEL_ADMIN          # EDIT ME: role that owns the DBT_LAKEHOUSE schema
+      warehouse: ACCEL_WH
+      database: ACCEL_DB
+      schema: DBT_LAKEHOUSE
+      threads: 4
