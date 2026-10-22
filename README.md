@@ -1,0 +1,2 @@
+# snowflake-projects
+snowflake accelerators
