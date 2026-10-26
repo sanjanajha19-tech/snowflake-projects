@@ -1,0 +1,189 @@
+/*=============================================================================
+  ACCELERATOR 20 - SAP Finance Accelerator
+  File 04 : Standard finance reports on the canonical model
+  Creates : RPT_TRIAL_BALANCE, RPT_AR_OPEN_ITEMS, RPT_AR_AGEING,
+            RPT_AP_OPEN_ITEMS, RPT_AP_AGEING, RPT_DSO_DPO_TREND
+  All reports use SAPFIN_PARAMS.KEY_DATE as the as-of date.
+  Run as  : ACCEL_ADMIN
+  Rerun   : safe.
+=============================================================================*/
+
+USE ROLE ACCEL_ADMIN;
+USE WAREHOUSE ACCEL_WH;
+USE DATABASE ACCEL_DB;
+CREATE SCHEMA IF NOT EXISTS SAPFIN;
+USE SCHEMA SAPFIN;
+
+------------------------------------------------------------------------------
+-- 1. Trial balance (local currency) as of KEY_DATE
+--    Balance sheet accounts carry forward; prior-year P&L is shown as a
+--    retained-earnings carry-forward line so every company code nets to zero.
+------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW RPT_TRIAL_BALANCE AS
+WITH p AS (
+    SELECT KEY_DATE, YEAR(KEY_DATE) AS FY, DATE_FROM_PARTS(YEAR(KEY_DATE), 1, 1) AS FY_START
+    FROM ACCEL_DB.SAPFIN.SAPFIN_PARAMS
+),
+e AS (
+    SELECT g.COMPANY_CODE, g.GL_ACCOUNT, g.GL_ACCOUNT_NAME, g.ACCOUNT_CLASS, g.POSTING_DATE,
+           g.AMOUNT_LOCAL, g.LOCAL_CURRENCY, p.KEY_DATE, p.FY, p.FY_START
+    FROM ACCEL_DB.SAPFIN.FIN_GL_ENTRY g
+    CROSS JOIN p
+    WHERE g.POSTING_DATE <= p.KEY_DATE
+),
+acct AS (
+    SELECT COMPANY_CODE, GL_ACCOUNT, MAX(GL_ACCOUNT_NAME) AS ACCOUNT_NAME, MAX(ACCOUNT_CLASS) AS ACCOUNT_CLASS,
+           SUM(IFF(POSTING_DATE <  FY_START AND ACCOUNT_CLASS = 'Balance Sheet', AMOUNT_LOCAL, 0)) AS OPENING,
+           SUM(IFF(POSTING_DATE >= FY_START AND AMOUNT_LOCAL > 0,  AMOUNT_LOCAL, 0))              AS DEBITS,
+           SUM(IFF(POSTING_DATE >= FY_START AND AMOUNT_LOCAL < 0, -AMOUNT_LOCAL, 0))              AS CREDITS,
+           MAX(LOCAL_CURRENCY) AS LOCAL_CURRENCY, MAX(FY) AS FY, MAX(KEY_DATE) AS KEY_DATE
+    FROM e
+    GROUP BY COMPANY_CODE, GL_ACCOUNT
+),
+re AS (
+    SELECT COMPANY_CODE, 'RE-CF' AS GL_ACCOUNT, 'Retained earnings (prior-year P&L carried forward)' AS ACCOUNT_NAME,
+           'Balance Sheet' AS ACCOUNT_CLASS, SUM(AMOUNT_LOCAL) AS OPENING, 0 AS DEBITS, 0 AS CREDITS,
+           MAX(LOCAL_CURRENCY) AS LOCAL_CURRENCY, MAX(FY) AS FY, MAX(KEY_DATE) AS KEY_DATE
+    FROM e
+    WHERE POSTING_DATE < FY_START AND ACCOUNT_CLASS = 'Profit & Loss'
+    GROUP BY COMPANY_CODE
+),
+allrows AS (
+    SELECT * FROM acct
+    UNION ALL
+    SELECT * FROM re
+)
+SELECT KEY_DATE, FY AS FISCAL_YEAR, COMPANY_CODE, LOCAL_CURRENCY, GL_ACCOUNT, ACCOUNT_NAME, ACCOUNT_CLASS,
+       ROUND(OPENING, 2)                     AS OPENING_BALANCE,
+       ROUND(DEBITS, 2)                      AS DEBITS_YTD,
+       ROUND(CREDITS, 2)                     AS CREDITS_YTD,
+       ROUND(OPENING + DEBITS - CREDITS, 2)  AS CLOSING_BALANCE
+FROM allrows;
+
+------------------------------------------------------------------------------
+-- 2. Accounts receivable: open items and ageing
+------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW RPT_AR_OPEN_ITEMS AS
+WITH p AS (SELECT KEY_DATE FROM ACCEL_DB.SAPFIN.SAPFIN_PARAMS)
+SELECT g.COMPANY_CODE, g.CUSTOMER_ID, c.CUSTOMER_NAME, c.COUNTRY_CODE,
+       g.DOCUMENT_NUMBER, g.FISCAL_YEAR, g.POSTING_DATE, g.DUE_DATE, g.PAYMENT_TERMS,
+       g.AMOUNT_LOCAL AS OPEN_AMOUNT_LOCAL, g.LOCAL_CURRENCY,
+       g.AMOUNT_DOCUMENT AS OPEN_AMOUNT_DOC, g.DOCUMENT_CURRENCY,
+       g.SALES_ORDER_ID,
+       p.KEY_DATE,
+       DATEDIFF(DAY, g.DUE_DATE, p.KEY_DATE) AS DAYS_OVERDUE,
+       CASE WHEN DATEDIFF(DAY, g.DUE_DATE, p.KEY_DATE) <= 0   THEN '0 Not due'
+            WHEN DATEDIFF(DAY, g.DUE_DATE, p.KEY_DATE) <= 30  THEN '1 1-30'
+            WHEN DATEDIFF(DAY, g.DUE_DATE, p.KEY_DATE) <= 60  THEN '2 31-60'
+            WHEN DATEDIFF(DAY, g.DUE_DATE, p.KEY_DATE) <= 90  THEN '3 61-90'
+            WHEN DATEDIFF(DAY, g.DUE_DATE, p.KEY_DATE) <= 180 THEN '4 91-180'
+            ELSE '5 >180' END AS AGEING_BUCKET
+FROM ACCEL_DB.SAPFIN.FIN_GL_ENTRY g
+CROSS JOIN p
+LEFT JOIN ACCEL_DB.SAPFIN.FIN_CUSTOMER c ON c.CUSTOMER_ID = g.CUSTOMER_ID
+WHERE g.ACCOUNT_TYPE = 'Customer'
+  AND g.POSTING_DATE <= p.KEY_DATE
+  AND (g.CLEARING_DATE IS NULL OR g.CLEARING_DATE > p.KEY_DATE);
+
+CREATE OR REPLACE VIEW RPT_AR_AGEING AS
+SELECT COMPANY_CODE, CUSTOMER_ID, CUSTOMER_NAME, LOCAL_CURRENCY, KEY_DATE,
+       SUM(OPEN_AMOUNT_LOCAL)                                                AS TOTAL_OPEN,
+       SUM(IFF(AGEING_BUCKET = '0 Not due', OPEN_AMOUNT_LOCAL, 0))           AS NOT_DUE,
+       SUM(IFF(AGEING_BUCKET = '1 1-30',    OPEN_AMOUNT_LOCAL, 0))           AS DUE_1_30,
+       SUM(IFF(AGEING_BUCKET = '2 31-60',   OPEN_AMOUNT_LOCAL, 0))           AS DUE_31_60,
+       SUM(IFF(AGEING_BUCKET = '3 61-90',   OPEN_AMOUNT_LOCAL, 0))           AS DUE_61_90,
+       SUM(IFF(AGEING_BUCKET = '4 91-180',  OPEN_AMOUNT_LOCAL, 0))           AS DUE_91_180,
+       SUM(IFF(AGEING_BUCKET = '5 >180',    OPEN_AMOUNT_LOCAL, 0))           AS DUE_OVER_180,
+       MAX(DAYS_OVERDUE)                                                     AS MAX_DAYS_OVERDUE,
+       COUNT(*)                                                              AS OPEN_ITEMS
+FROM ACCEL_DB.SAPFIN.RPT_AR_OPEN_ITEMS
+GROUP BY COMPANY_CODE, CUSTOMER_ID, CUSTOMER_NAME, LOCAL_CURRENCY, KEY_DATE;
+
+------------------------------------------------------------------------------
+-- 3. Accounts payable: open items and ageing (shown as positive liabilities)
+------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW RPT_AP_OPEN_ITEMS AS
+WITH p AS (SELECT KEY_DATE FROM ACCEL_DB.SAPFIN.SAPFIN_PARAMS)
+SELECT g.COMPANY_CODE, g.VENDOR_ID, v.VENDOR_NAME, v.COUNTRY_CODE, v.IS_POSTING_BLOCKED,
+       g.DOCUMENT_NUMBER, g.FISCAL_YEAR, g.POSTING_DATE, g.DUE_DATE, g.PAYMENT_TERMS,
+       -g.AMOUNT_LOCAL AS OPEN_AMOUNT_LOCAL, g.LOCAL_CURRENCY,
+       -g.AMOUNT_DOCUMENT AS OPEN_AMOUNT_DOC, g.DOCUMENT_CURRENCY,
+       g.PURCHASE_ORDER_ID,
+       p.KEY_DATE,
+       DATEDIFF(DAY, g.DUE_DATE, p.KEY_DATE) AS DAYS_OVERDUE,
+       CASE WHEN DATEDIFF(DAY, g.DUE_DATE, p.KEY_DATE) <= 0   THEN '0 Not due'
+            WHEN DATEDIFF(DAY, g.DUE_DATE, p.KEY_DATE) <= 30  THEN '1 1-30'
+            WHEN DATEDIFF(DAY, g.DUE_DATE, p.KEY_DATE) <= 60  THEN '2 31-60'
+            WHEN DATEDIFF(DAY, g.DUE_DATE, p.KEY_DATE) <= 90  THEN '3 61-90'
+            ELSE '4 >90' END AS AGEING_BUCKET
+FROM ACCEL_DB.SAPFIN.FIN_GL_ENTRY g
+CROSS JOIN p
+LEFT JOIN ACCEL_DB.SAPFIN.FIN_VENDOR v ON v.VENDOR_ID = g.VENDOR_ID
+WHERE g.ACCOUNT_TYPE = 'Vendor'
+  AND g.POSTING_DATE <= p.KEY_DATE
+  AND (g.CLEARING_DATE IS NULL OR g.CLEARING_DATE > p.KEY_DATE);
+
+CREATE OR REPLACE VIEW RPT_AP_AGEING AS
+SELECT COMPANY_CODE, VENDOR_ID, VENDOR_NAME, LOCAL_CURRENCY, KEY_DATE,
+       SUM(OPEN_AMOUNT_LOCAL)                                        AS TOTAL_OPEN,
+       SUM(IFF(AGEING_BUCKET = '0 Not due', OPEN_AMOUNT_LOCAL, 0))   AS NOT_DUE,
+       SUM(IFF(AGEING_BUCKET = '1 1-30',    OPEN_AMOUNT_LOCAL, 0))   AS DUE_1_30,
+       SUM(IFF(AGEING_BUCKET = '2 31-60',   OPEN_AMOUNT_LOCAL, 0))   AS DUE_31_60,
+       SUM(IFF(AGEING_BUCKET = '3 61-90',   OPEN_AMOUNT_LOCAL, 0))   AS DUE_61_90,
+       SUM(IFF(AGEING_BUCKET = '4 >90',     OPEN_AMOUNT_LOCAL, 0))   AS DUE_OVER_90,
+       COUNT(*)                                                      AS OPEN_ITEMS
+FROM ACCEL_DB.SAPFIN.RPT_AP_OPEN_ITEMS
+GROUP BY COMPANY_CODE, VENDOR_ID, VENDOR_NAME, LOCAL_CURRENCY, KEY_DATE;
+
+------------------------------------------------------------------------------
+-- 4. DSO / DPO trend (count-back simplified: balance / last-90-day flow x 90)
+------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW RPT_DSO_DPO_TREND AS
+WITH p AS (SELECT KEY_DATE FROM ACCEL_DB.SAPFIN.SAPFIN_PARAMS),
+as_of AS (
+    SELECT LEAST(LAST_DAY(DATEADD(MONTH, -g.N, p.KEY_DATE)), p.KEY_DATE) AS AS_OF_DATE
+    FROM p
+    CROSS JOIN (SELECT ROW_NUMBER() OVER (ORDER BY SEQ4()) - 1 AS N FROM TABLE(GENERATOR(ROWCOUNT => 13))) g
+),
+x AS (
+    SELECT a.AS_OF_DATE, e.COMPANY_CODE, MAX(e.LOCAL_CURRENCY) AS LOCAL_CURRENCY,
+           SUM(IFF(e.ACCOUNT_TYPE = 'Customer' AND e.POSTING_DATE <= a.AS_OF_DATE
+                   AND (e.CLEARING_DATE IS NULL OR e.CLEARING_DATE > a.AS_OF_DATE), e.AMOUNT_LOCAL, 0))  AS AR_BALANCE,
+           SUM(IFF(e.GL_ACCOUNT = '800000' AND e.POSTING_DATE > DATEADD(DAY, -90, a.AS_OF_DATE)
+                   AND e.POSTING_DATE <= a.AS_OF_DATE, -e.AMOUNT_LOCAL, 0))                               AS REVENUE_90D,
+           SUM(IFF(e.ACCOUNT_TYPE = 'Vendor' AND e.POSTING_DATE <= a.AS_OF_DATE
+                   AND (e.CLEARING_DATE IS NULL OR e.CLEARING_DATE > a.AS_OF_DATE), -e.AMOUNT_LOCAL, 0)) AS AP_BALANCE,
+           SUM(IFF(e.GL_ACCOUNT = '300000' AND e.AMOUNT_LOCAL > 0
+                   AND e.POSTING_DATE > DATEADD(DAY, -90, a.AS_OF_DATE)
+                   AND e.POSTING_DATE <= a.AS_OF_DATE, e.AMOUNT_LOCAL, 0))                                AS PURCHASES_90D
+    FROM as_of a
+    CROSS JOIN ACCEL_DB.SAPFIN.FIN_GL_ENTRY e
+    WHERE e.POSTING_DATE <= a.AS_OF_DATE
+    GROUP BY a.AS_OF_DATE, e.COMPANY_CODE
+)
+SELECT AS_OF_DATE, COMPANY_CODE, LOCAL_CURRENCY,
+       ROUND(AR_BALANCE, 2) AS AR_BALANCE, ROUND(REVENUE_90D, 2) AS REVENUE_90D,
+       ROUND(AR_BALANCE / NULLIF(REVENUE_90D, 0) * 90, 1)  AS DSO_DAYS,
+       ROUND(AP_BALANCE, 2) AS AP_BALANCE, ROUND(PURCHASES_90D, 2) AS PURCHASES_90D,
+       ROUND(AP_BALANCE / NULLIF(PURCHASES_90D, 0) * 90, 1) AS DPO_DAYS,
+       ROUND(AR_BALANCE / NULLIF(REVENUE_90D, 0) * 90, 1)
+         - ROUND(AP_BALANCE / NULLIF(PURCHASES_90D, 0) * 90, 1) AS DSO_MINUS_DPO
+FROM x;
+
+------------------------------------------------------------------------------
+-- 5. Show the reports
+------------------------------------------------------------------------------
+SELECT * FROM RPT_TRIAL_BALANCE ORDER BY COMPANY_CODE, GL_ACCOUNT;
+
+-- Trial balance check: every company code must net to zero
+SELECT COMPANY_CODE, SUM(CLOSING_BALANCE) AS MUST_BE_ZERO FROM RPT_TRIAL_BALANCE GROUP BY 1;
+
+SELECT COMPANY_CODE, LOCAL_CURRENCY,
+       SUM(NOT_DUE) AS NOT_DUE, SUM(DUE_1_30) AS DUE_1_30, SUM(DUE_31_60) AS DUE_31_60,
+       SUM(DUE_61_90) AS DUE_61_90, SUM(DUE_91_180) AS DUE_91_180, SUM(DUE_OVER_180) AS DUE_OVER_180,
+       SUM(TOTAL_OPEN) AS TOTAL_OPEN
+FROM RPT_AR_AGEING GROUP BY 1, 2 ORDER BY 1;
+
+SELECT * FROM RPT_AR_AGEING ORDER BY TOTAL_OPEN DESC LIMIT 20;
+SELECT * FROM RPT_AP_AGEING ORDER BY TOTAL_OPEN DESC LIMIT 20;
+SELECT * FROM RPT_DSO_DPO_TREND ORDER BY COMPANY_CODE, AS_OF_DATE;
