@@ -1,0 +1,32 @@
+# Snowflake CLI project definition (definition_version 2)
+# Usage from this folder:
+#   snow app run        -c <connection>   # build package, upload files, install/upgrade app (dev mode)
+#   snow app teardown   -c <connection>   # drop app and package
+#   snow app version create V1_0 -c <connection>   # create a version for release
+definition_version: 2
+entities:
+  pkg:
+    type: application package
+    identifier: DATA_HEALTH_CHECKER_PKG
+    stage: STAGE_CONTENT.APP_STAGE
+    manifest: app/manifest.yml
+    artifacts:
+      - src: app/manifest.yml
+        dest: manifest.yml
+      - src: app/setup_script.sql
+        dest: setup_script.sql
+      - src: app/README.md
+        dest: README.md
+      - src: app/streamlit/app.py
+        dest: streamlit/app.py
+    meta:
+      role: ACCEL_ADMIN         # EDIT ME if you use a different role
+      warehouse: ACCEL_WH       # EDIT ME
+  app:
+    type: application
+    identifier: DATA_HEALTH_CHECKER_APP
+    from:
+      target: pkg
+    meta:
+      role: ACCEL_ADMIN         # EDIT ME
+      warehouse: ACCEL_WH       # EDIT ME
