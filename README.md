@@ -11,12 +11,6 @@
 
 Read `CONVENTIONS.md` for names of roles, warehouses, schemas and demo tables.
 
-## Before a client demo
-- Scripts were written against current Snowflake documentation but not yet run on a live account. Run each one end to end on the build account once and fix any small errors before showing it.
-- Cortex AI features depend on region and model availability. If a model is unavailable, change the `-- EDIT ME` model name or enable cross-region inference (see `00_setup/01_account_setup.sql`).
-- Some features need a higher edition: failover (19) needs Business Critical.
-- Emission factors (26), GST rules (27) and privacy logic (18) are illustrative placeholders, not authoritative values or legal advice.
-
 ## Index
 | # | Accelerator | Pillar | Streamlit app |
 |---|---|---|---|
