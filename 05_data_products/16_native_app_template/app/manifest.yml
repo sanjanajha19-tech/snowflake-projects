@@ -1,0 +1,19 @@
+# Snowflake Native App manifest - Data Health Checker
+# manifest_version 2 enables automated granting of account-level privileges.
+# This app requests none: it only reads ONE consumer table through a reference.
+manifest_version: 2
+
+artifacts:
+  setup_script: setup_script.sql
+  readme: README.md
+  default_streamlit: CORE.DATA_HEALTH_UI
+
+references:
+  - consumer_table:
+      label: "Table to profile"
+      description: "Any table in your account. The app gets SELECT on this table only and profiles completeness, uniqueness and value ranges."
+      privileges:
+        - SELECT
+      object_type: TABLE
+      multi_valued: false
+      register_callback: CORE.REGISTER_SINGLE_REFERENCE
