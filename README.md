@@ -51,7 +51,3 @@ Read `CONVENTIONS.md` for names of roles, warehouses, schemas and demo tables.
 | 28 | Security Health Check | Governance & FinOps | |
 | 29 | AI SQL Playbook | AI & Agents | |
 
-## Suggested first demos
-- **Any company already on Snowflake:** 08 FinOps → 28 Security Health Check → 10 Talk to Your Data.
-- **Company on a legacy warehouse:** 01 Migration Assessment → 03 Validation → 05 Lakehouse.
-- **Business audience:** 10 Agent → 24 Voice of Customer → 25 Control Tower or 21 Journal Entry Analytics.
