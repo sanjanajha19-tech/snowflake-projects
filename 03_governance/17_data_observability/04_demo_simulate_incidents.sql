@@ -1,0 +1,64 @@
+/* =============================================================================
+   17 DATA OBSERVABILITY | 04_demo_simulate_incidents.sql
+   Creates a small feed table OBSERVABILITY.DEMO_ORDER_FEED (copy of recent
+   DEMO.ORDERS), puts it under monitoring with tight thresholds, takes a
+   baseline, then breaks it on purpose: deletes 60% of rows (VOLUME_CHANGE +
+   VOLUME_MIN) and adds a column (SCHEMA_CHANGE). A 1-minute freshness SLA makes
+   FRESHNESS fire on the next evaluation. DEMO data is not touched.
+   Run as: ACCEL_ADMIN. Rerunnable (rebuilds the feed table).
+============================================================================= */
+USE ROLE ACCEL_ADMIN;
+USE WAREHOUSE ACCEL_WH;
+USE DATABASE ACCEL_DB;
+CREATE SCHEMA IF NOT EXISTS OBSERVABILITY;
+USE SCHEMA OBSERVABILITY;
+
+-- 1. Feed table with ~ the last 90 days of orders
+CREATE OR REPLACE TABLE DEMO_ORDER_FEED AS
+SELECT ORDER_ID, ORDER_DATE, CUSTOMER_ID, CHANNEL, STATUS, CURRENCY, ORDER_TOTAL
+FROM ACCEL_DB.DEMO.ORDERS
+WHERE ORDER_DATE >= DATEADD('day', -90, (SELECT MAX(ORDER_DATE) FROM ACCEL_DB.DEMO.ORDERS));
+
+-- 2. Monitor it: freshness 1 minute, at least 1,000 rows, max 20% change, schema check
+DELETE FROM MONITOR_CONFIG WHERE SCHEMA_NAME = 'OBSERVABILITY' AND TABLE_NAME = 'DEMO_ORDER_FEED';
+INSERT INTO MONITOR_CONFIG
+  (SCHEMA_NAME, TABLE_NAME, FRESHNESS_SLA_MINUTES, MIN_ROWS, MAX_ROW_CHANGE_PCT, CHECK_SCHEMA, SEVERITY, OWNER, ENABLED, UPDATED_AT)
+SELECT 'OBSERVABILITY', 'DEMO_ORDER_FEED', 1, GREATEST(1000, FLOOR(COUNT(*) * 0.5)), 20, TRUE, 'HIGH', 'order-pipeline-team', TRUE, CURRENT_TIMESTAMP()
+FROM DEMO_ORDER_FEED;
+
+-- Close incidents left over from a previous demo run of this table
+UPDATE INCIDENTS SET STATUS = 'RESOLVED', RESOLVED_AT = CURRENT_TIMESTAMP(), RESOLVED_BY = CURRENT_USER(),
+                     RESOLUTION_NOTE = 'Demo reset'
+ WHERE SCHEMA_NAME = 'OBSERVABILITY' AND TABLE_NAME = 'DEMO_ORDER_FEED' AND STATUS <> 'RESOLVED';
+
+-- 3. Baseline (healthy: table was just loaded)
+CALL EVALUATE_MONITORS();
+
+-- 4. Break it: lose 60% of rows and add a column, as a faulty upstream load would
+DELETE FROM DEMO_ORDER_FEED WHERE MOD(ORDER_ID, 10) < 6;
+ALTER TABLE DEMO_ORDER_FEED ADD COLUMN DISCOUNT_CODE VARCHAR;
+
+-- Wait > 1 minute so the freshness SLA is breached as well
+CALL SYSTEM$WAIT(70);
+
+-- 5. Evaluate: expect VOLUME_CHANGE, VOLUME_MIN, SCHEMA_CHANGE and FRESHNESS on DEMO_ORDER_FEED
+CALL EVALUATE_MONITORS();
+
+SELECT INCIDENT_ID, DETECTED_AT, TABLE_NAME, MONITOR_TYPE, SEVERITY, OBSERVED_VALUE, THRESHOLD, MESSAGE, STATUS
+FROM INCIDENTS
+WHERE SCHEMA_NAME = 'OBSERVABILITY' AND TABLE_NAME = 'DEMO_ORDER_FEED' AND STATUS = 'OPEN'
+ORDER BY INCIDENT_ID;
+
+SELECT SCHEMA_NAME, TABLE_NAME, HEALTH, ROW_COUNT, OPEN_INCIDENTS, OPEN_MONITORS
+FROM V_TABLE_HEALTH ORDER BY OPEN_INCIDENTS DESC, TABLE_NAME;
+
+-- 6. Recovery: reload the rows. The next evaluation auto-resolves VOLUME_MIN and
+--    FRESHNESS (state incidents) and raises a new VOLUME_CHANGE (rows came back).
+-- INSERT INTO DEMO_ORDER_FEED (ORDER_ID, ORDER_DATE, CUSTOMER_ID, CHANNEL, STATUS, CURRENCY, ORDER_TOTAL)
+-- SELECT ORDER_ID, ORDER_DATE, CUSTOMER_ID, CHANNEL, STATUS, CURRENCY, ORDER_TOTAL FROM ACCEL_DB.DEMO.ORDERS
+-- WHERE ORDER_DATE >= DATEADD('day', -90, (SELECT MAX(ORDER_DATE) FROM ACCEL_DB.DEMO.ORDERS)) AND MOD(ORDER_ID, 10) < 6;
+-- CALL EVALUATE_MONITORS();
+
+-- 7. Send the e-mail now (needs verified recipients in OBS_SETTINGS; failures are logged):
+-- CALL NOTIFY_NEW_INCIDENTS();
+-- SELECT * FROM NOTIFICATION_LOG ORDER BY SENT_AT DESC;
